@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a macOS desktop launcher for the Echo Prompt Calibrator."""
+"""Create a macOS desktop launcher for the Data Prompt Calibrator."""
 
 from __future__ import annotations
 
@@ -10,11 +10,11 @@ from pathlib import Path
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create a desktop launcher (.command) for Echo Prompt Calibrator."
+        description="Create a desktop launcher (.command) for Data Prompt Calibrator."
     )
     parser.add_argument(
         "--name",
-        default="Launch Echo Prompt Calibrator",
+        default="Launch Data Prompt Calibrator",
         help="Launcher file name without extension",
     )
     parser.add_argument(
@@ -34,7 +34,7 @@ def main() -> int:
     args = parse_args()
     desktop_dir = Path(args.desktop_dir).expanduser().resolve()
     workspace_dir = Path(args.workspace_dir).expanduser().resolve()
-    launch_script = workspace_dir / "backend" / "scripts" / "launch_echo_calibrator.py"
+    launch_script = workspace_dir / "backend" / "scripts" / "launch_calibrator.py"
 
     if not launch_script.exists():
         raise SystemExit(f"Launch script not found: {launch_script}")
@@ -45,9 +45,9 @@ def main() -> int:
     content = f"""#!/bin/zsh
 cd "{workspace_dir}" || exit 1
 if command -v python3 >/dev/null 2>&1; then
-  python3 "backend/scripts/launch_echo_calibrator.py"
+  python3 "backend/scripts/launch_calibrator.py"
 else
-  python "backend/scripts/launch_echo_calibrator.py"
+  python "backend/scripts/launch_calibrator.py"
 fi
 """
     launcher_path.write_text(content, encoding="utf-8")
@@ -56,7 +56,7 @@ fi
     launcher_path.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
     print(f"Created desktop launcher: {launcher_path}")
-    print("Double-click it to open the Echo Prompt Calibrator.")
+    print("Double-click it to open the Data Prompt Calibrator.")
     return 0
 
 

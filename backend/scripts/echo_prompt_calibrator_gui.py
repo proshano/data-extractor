@@ -17,6 +17,7 @@ import csv
 import json
 import os
 import platform
+import queue
 import re
 import shutil
 import subprocess
@@ -26,7 +27,7 @@ import tkinter as tk
 import time
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 
@@ -40,6 +41,8 @@ DEFAULT_MODEL_DIRS = [
 ]
 SLOW_MODEL_DIRS = [Path.home() / ".cache" / "huggingface" / "hub"]
 MODEL_SCAN_TIME_BUDGET_SECONDS = 2.0
+STATE_DIR = Path.home() / ".echo_prompt_calibrator"
+STATE_FILE = STATE_DIR / "calibrator_state.json"
 
 RECOMMENDED_MODELS = [
     (
@@ -58,6 +61,9 @@ RECOMMENDED_MODELS = [
         "qwen2.5-7b-instruct-q4_k_m.gguf",
     ),
 ]
+
+ID_COLUMN_CANDIDATES = ["StudyID", "study_id", "id", "patient_id"]
+REPORT_COLUMN_CANDIDATES = ["Report", "report_text", "report", "echo_report", "narrative"]
 
 
 class EchoPromptCalibratorApp:
@@ -89,8 +95,13 @@ class EchoPromptCalibratorApp:
         self.sample_status_var = tk.StringVar(value="Sample: none")
         self.server_status_var = tk.StringVar(value="Server: unknown")
         self.model_status_var = tk.StringVar(value="Models: not checked")
+        self.output_queue: "queue.Queue[str]" = queue.Queue()
+        self.state_save_after_id: Optional[str] = None
 
         self._build_ui()
+        self.root.after(60, self._drain_output_queue)
+        self._load_persistent_state()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.append_output(
             "Quick start: 1) Select CSV 2) Refresh local models 3) Start server 4) Refresh server models 5) Test feature."
         )
@@ -234,18 +245,168 @@ class EchoPromptCalibratorApp:
         self.output_text.pack(fill=tk.BOTH, expand=True)
 
     def append_output(self, text: str) -> None:
-        def _append() -> None:
-            self.output_text.insert(tk.END, text + "\n")
-            self.output_text.see(tk.END)
+        self.output_queue.put(text)
 
-        self.root.after(0, _append)
+    def _drain_output_queue(self) -> None:
+        lines: List[str] = []
+        for _ in range(200):
+            try:
+                lines.append(self.output_queue.get_nowait())
+            except queue.Empty:
+                break
+        if lines:
+            self.output_text.insert(tk.END, "\n".join(lines) + "\n")
+            self.output_text.see(tk.END)
+        self.root.after(60, self._drain_output_queue)
 
     def _on_ui(self, callback: Callable[[], None]) -> None:
         self.root.after(0, callback)
 
+    def _build_state_payload(self) -> Dict[str, Any]:
+        return {
+            "version": 1,
+            "csv_path": self.csv_path_var.get().strip(),
+            "schema_path": self.schema_path_var.get().strip(),
+            "llama_url": self.llama_url_var.get().strip(),
+            "temperature": self.temperature_var.get().strip(),
+            "max_retries": self.max_retries_var.get().strip(),
+            "id_column": self.id_column_var.get().strip(),
+            "report_column": self.report_column_var.get().strip(),
+            "sample_index": self.sample_index_var.get().strip(),
+            "server_port": self.server_port_var.get().strip(),
+            "local_model": self.local_model_var.get().strip(),
+            "server_model": self.server_model_var.get().strip(),
+            "recommended_model": self.recommended_model_var.get().strip(),
+            "features": self.schema_features,
+        }
+
+    def _save_persistent_state_now(self, announce: bool = False) -> None:
+        try:
+            payload = self._build_state_payload()
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp_path = STATE_FILE.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            tmp_path.replace(STATE_FILE)
+            if announce:
+                self.append_output(f"Saved workspace state: {STATE_FILE}")
+        except Exception as exc:
+            self.append_output(f"Warning: failed to save workspace state: {exc}")
+
+    def _save_persistent_state(self, announce: bool = False) -> None:
+        if self.state_save_after_id is not None:
+            try:
+                self.root.after_cancel(self.state_save_after_id)
+            except Exception:
+                pass
+
+        def flush_save() -> None:
+            self.state_save_after_id = None
+            thread = threading.Thread(
+                target=self._save_persistent_state_now,
+                kwargs={"announce": announce},
+                daemon=True,
+            )
+            thread.start()
+
+        self.state_save_after_id = self.root.after(350, flush_save)
+
+    def _load_persistent_state(self) -> None:
+        if not STATE_FILE.exists():
+            return
+        try:
+            payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            self.csv_path_var.set(str(payload.get("csv_path", "")))
+            self.schema_path_var.set(str(payload.get("schema_path", "")))
+            self.llama_url_var.set(str(payload.get("llama_url", self.llama_url_var.get())))
+            self.temperature_var.set(str(payload.get("temperature", self.temperature_var.get())))
+            self.max_retries_var.set(str(payload.get("max_retries", self.max_retries_var.get())))
+            self.id_column_var.set(str(payload.get("id_column", self.id_column_var.get())))
+            self.report_column_var.set(str(payload.get("report_column", self.report_column_var.get())))
+            self.sample_index_var.set(str(payload.get("sample_index", self.sample_index_var.get())))
+            self.server_port_var.set(str(payload.get("server_port", self.server_port_var.get())))
+            self.local_model_var.set(str(payload.get("local_model", "")))
+            self.server_model_var.set(str(payload.get("server_model", "")))
+            self.recommended_model_var.set(
+                str(payload.get("recommended_model", self.recommended_model_var.get()))
+            )
+            features = payload.get("features", [])
+            if isinstance(features, list):
+                self.schema_features = [item for item in features if isinstance(item, dict)]
+            if self.schema_features:
+                self.refresh_feature_list()
+            if self.csv_path_var.get().strip():
+                self.csv_status_var.set(f"CSV path restored: {Path(self.csv_path_var.get()).name}")
+            self.append_output(
+                f"Loaded saved workspace state with {len(self.schema_features)} feature(s)."
+            )
+        except Exception as exc:
+            self.append_output(f"Warning: could not load saved workspace state: {exc}")
+
+    def _on_close(self) -> None:
+        self.save_feature_edits(silent=True)
+        self._save_persistent_state_now(announce=False)
+        self.root.destroy()
+
     def _run_in_thread(self, target) -> None:
         thread = threading.Thread(target=target, daemon=True)
         thread.start()
+
+    def _normalize_column_name(self, value: str) -> str:
+        return str(value).replace("\ufeff", "").strip()
+
+    def _resolve_column_name(self, requested: str) -> str:
+        requested_clean = self._normalize_column_name(requested)
+        if not requested_clean:
+            return ""
+        if requested_clean in self.input_columns:
+            return requested_clean
+        lowered = requested_clean.lower()
+        for column in self.input_columns:
+            if column.lower() == lowered:
+                return column
+        return requested_clean
+
+    def _pick_existing_column(self, candidates: List[str]) -> str:
+        lowered_to_actual = {column.lower(): column for column in self.input_columns}
+        for candidate in candidates:
+            existing = lowered_to_actual.get(candidate.lower())
+            if existing:
+                return existing
+        return ""
+
+    def _read_csv_data_sync(self, csv_path: Path) -> Tuple[List[str], List[Dict[str, str]], str]:
+        encodings_to_try = ["utf-8-sig", "utf-8", "latin-1"]
+        last_error = "unknown CSV read error"
+        for encoding in encodings_to_try:
+            try:
+                with csv_path.open("r", encoding=encoding, newline="") as sample_handle:
+                    sample = sample_handle.read(16384)
+                    sample_handle.seek(0)
+                    try:
+                        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+                    except csv.Error:
+                        dialect = csv.excel
+                    reader = csv.DictReader(sample_handle, dialect=dialect)
+                    raw_headers = list(reader.fieldnames or [])
+                    headers: List[str] = [self._normalize_column_name(h) for h in raw_headers if h is not None]
+                    if not headers:
+                        raise ValueError("No header columns detected.")
+
+                    rows: List[Dict[str, str]] = []
+                    for raw_row in reader:
+                        row: Dict[str, str] = {}
+                        for raw_key, raw_value in raw_row.items():
+                            key = self._normalize_column_name(raw_key or "")
+                            if not key:
+                                continue
+                            row[key] = str(raw_value or "")
+                        if row:
+                            rows.append(row)
+                return headers, rows, encoding
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+        raise ValueError(f"Failed to parse CSV with supported encodings. Last error: {last_error}")
 
     def browse_csv(self) -> None:
         path = filedialog.askopenfilename(
@@ -254,6 +415,7 @@ class EchoPromptCalibratorApp:
         )
         if path:
             self.csv_path_var.set(path)
+            self._save_persistent_state(announce=False)
             self.load_csv()
 
     def browse_schema(self) -> None:
@@ -263,6 +425,7 @@ class EchoPromptCalibratorApp:
         )
         if path:
             self.schema_path_var.set(path)
+            self._save_persistent_state(announce=False)
 
     def browse_model_file(self) -> None:
         path = filedialog.askopenfilename(
@@ -274,6 +437,7 @@ class EchoPromptCalibratorApp:
             if path not in self.local_model_paths:
                 self.local_model_paths.append(path)
                 self.local_model_combo["values"] = self.local_model_paths
+            self._save_persistent_state(announce=False)
 
     def load_csv(self) -> None:
         csv_path = Path(self.csv_path_var.get().strip())
@@ -281,25 +445,52 @@ class EchoPromptCalibratorApp:
             messagebox.showerror("Error", f"CSV file not found: {csv_path}")
             self.csv_status_var.set("CSV: load failed (file not found)")
             return
-        try:
-            with csv_path.open("r", encoding="utf-8", newline="") as handle:
-                reader = csv.DictReader(handle)
-                self.input_columns = list(reader.fieldnames or [])
-                self.input_rows = [row for row in reader]
-            self.append_output(
-                f"Loaded CSV: {csv_path} | rows={len(self.input_rows)} | columns={self.input_columns}"
-            )
-            self.csv_status_var.set(
-                f"CSV loaded: {csv_path.name} | rows={len(self.input_rows)} | columns={len(self.input_columns)}"
-            )
-            if self.id_column_var.get().strip() not in self.input_columns and "StudyID" in self.input_columns:
-                self.id_column_var.set("StudyID")
-            if self.report_column_var.get().strip() not in self.input_columns and "Report" in self.input_columns:
-                self.report_column_var.set("Report")
-            self.show_sample_report()
-        except Exception as exc:
-            messagebox.showerror("Error", f"Failed to read CSV: {exc}")
-            self.csv_status_var.set("CSV: load failed")
+        self.csv_status_var.set(f"CSV: loading {csv_path.name} ...")
+
+        def worker() -> None:
+            try:
+                columns, rows, used_encoding = self._read_csv_data_sync(csv_path)
+            except Exception as exc:
+                self.append_output(f"CSV load failed: {exc}")
+                self._on_ui(lambda: messagebox.showerror("Error", f"Failed to read CSV: {exc}"))
+                self._on_ui(lambda: self.csv_status_var.set("CSV: load failed"))
+                return
+
+            def apply_loaded_csv() -> None:
+                self.input_columns = columns
+                self.input_rows = rows
+
+                requested_id_col = self._resolve_column_name(self.id_column_var.get().strip())
+                if requested_id_col in self.input_columns:
+                    self.id_column_var.set(requested_id_col)
+                else:
+                    fallback_id = self._pick_existing_column(ID_COLUMN_CANDIDATES)
+                    if fallback_id:
+                        self.id_column_var.set(fallback_id)
+
+                requested_report_col = self._resolve_column_name(self.report_column_var.get().strip())
+                if requested_report_col in self.input_columns:
+                    self.report_column_var.set(requested_report_col)
+                else:
+                    fallback_report = self._pick_existing_column(REPORT_COLUMN_CANDIDATES)
+                    if fallback_report:
+                        self.report_column_var.set(fallback_report)
+
+                preview_columns = ", ".join(self.input_columns[:6])
+                if len(self.input_columns) > 6:
+                    preview_columns += ", ..."
+                self.append_output(
+                    f"Loaded CSV: {csv_path} | rows={len(self.input_rows)} | columns={self.input_columns} | encoding={used_encoding}"
+                )
+                self.csv_status_var.set(
+                    f"CSV loaded: {csv_path.name} | rows={len(self.input_rows)} | columns={len(self.input_columns)} | [{preview_columns}]"
+                )
+                self.show_sample_report()
+                self._save_persistent_state(announce=False)
+
+            self._on_ui(apply_loaded_csv)
+
+        self._run_in_thread(worker)
 
     def load_schema(self) -> None:
         schema_path = Path(self.schema_path_var.get().strip())
@@ -310,6 +501,7 @@ class EchoPromptCalibratorApp:
             self.schema_features = echo_extract.load_schema(schema_path)
             self.refresh_feature_list()
             self.append_output(f"Loaded schema: {schema_path} | features={len(self.schema_features)}")
+            self._save_persistent_state(announce=False)
         except Exception as exc:
             messagebox.showerror("Error", f"Failed to load schema: {exc}")
 
@@ -334,6 +526,7 @@ class EchoPromptCalibratorApp:
         try:
             Path(output_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
             self.append_output(f"Saved schema to: {output_path}")
+            self._save_persistent_state(announce=False)
         except Exception as exc:
             messagebox.showerror("Error", f"Failed to save schema: {exc}")
 
@@ -361,6 +554,7 @@ class EchoPromptCalibratorApp:
         self.feature_listbox.selection_clear(0, tk.END)
         self.feature_listbox.selection_set(tk.END)
         self.on_feature_selected()
+        self._save_persistent_state(announce=False)
 
     def delete_feature(self) -> None:
         index = self.get_selected_feature_index()
@@ -370,6 +564,7 @@ class EchoPromptCalibratorApp:
         del self.schema_features[index]
         self.refresh_feature_list()
         self.append_output(f"Deleted feature: {deleted_name}")
+        self._save_persistent_state(announce=False)
 
     def get_selected_feature_index(self) -> Optional[int]:
         sel = self.feature_listbox.curselection()
@@ -418,6 +613,7 @@ class EchoPromptCalibratorApp:
         self.feature_listbox.selection_set(idx)
         if not silent:
             self.append_output(f"Saved edits for feature: {feature['name']}")
+        self._save_persistent_state(announce=False)
 
     def get_sample_row(self) -> Optional[Dict[str, str]]:
         if not self.input_rows:
@@ -437,17 +633,18 @@ class EchoPromptCalibratorApp:
             self.sample_status_var.set("Sample: none (load CSV first)")
             return
 
-        report_col = self.report_column_var.get().strip()
+        report_col = self._resolve_column_name(self.report_column_var.get().strip())
         report_text = str(row.get(report_col, ""))
         used_column = report_col
         fallback_used = False
         if not report_text.strip():
-            for candidate in ["Report", "report_text"]:
-                candidate_text = str(row.get(candidate, "")).strip()
+            for candidate in REPORT_COLUMN_CANDIDATES:
+                candidate_key = self._resolve_column_name(candidate)
+                candidate_text = str(row.get(candidate_key, "")).strip()
                 if candidate_text:
                     report_text = candidate_text
-                    used_column = candidate
-                    fallback_used = candidate != report_col
+                    used_column = candidate_key
+                    fallback_used = candidate_key != report_col
                     break
         if not report_text.strip():
             for col_name in self.input_columns:
@@ -463,7 +660,7 @@ class EchoPromptCalibratorApp:
             )
         self.sample_report_text.insert("1.0", report_text)
         sample_row = self.get_sample_row() or {}
-        id_col = self.id_column_var.get().strip()
+        id_col = self._resolve_column_name(self.id_column_var.get().strip())
         sample_id = str(sample_row.get(id_col, "")).strip() or "N/A"
         sample_number = self.sample_index_var.get().strip() or "1"
         preview_len = len(report_text.strip())
@@ -585,7 +782,7 @@ class EchoPromptCalibratorApp:
             messagebox.showerror("Error", "Select a feature first.")
             return
 
-        report_col = self.report_column_var.get().strip()
+        report_col = self._resolve_column_name(self.report_column_var.get().strip())
         report_text = str(row.get(report_col, "")).strip()
         feature = self.schema_features[idx]
         prompt = self.build_single_feature_prompt(feature, report_text)
@@ -642,7 +839,7 @@ class EchoPromptCalibratorApp:
         if row is None:
             messagebox.showerror("Error", "Load an input CSV first.")
             return
-        report_col = self.report_column_var.get().strip()
+        report_col = self._resolve_column_name(self.report_column_var.get().strip())
         report_text = str(row.get(report_col, "")).strip()
         features = list(self.schema_features)
         if not features:
@@ -704,7 +901,7 @@ class EchoPromptCalibratorApp:
         if row is None:
             messagebox.showerror("Error", "Load an input CSV first.")
             return
-        report_col = self.report_column_var.get().strip()
+        report_col = self._resolve_column_name(self.report_column_var.get().strip())
         report_text = str(row.get(report_col, "")).strip()
         combined_prompt = echo_extract.build_prompt(report_text=report_text, schema_features=self.schema_features)
         self.append_output("----- Combined prompt preview start -----")
@@ -772,6 +969,7 @@ class EchoPromptCalibratorApp:
             self.append_output("Model scan timed out for responsiveness. Use 'Deep Scan Models' for a broader scan.")
         if not models:
             self.append_output("No GGUF models found. Use 'Download Selected Model' to fetch one.")
+        self._save_persistent_state(announce=False)
 
     def refresh_local_models(self) -> None:
         self._run_in_thread(lambda: self._refresh_local_models_sync(include_slow_dirs=False))
@@ -812,6 +1010,7 @@ class EchoPromptCalibratorApp:
         else:
             self.server_status_var.set("Server: reachable, but no models reported")
         self.append_output(f"Server models: {models if models else 'none reported'}")
+        self._save_persistent_state(announce=False)
 
     def refresh_server_models(self) -> None:
         base_url = self.llama_url_var.get().strip()

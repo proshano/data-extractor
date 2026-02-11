@@ -9,6 +9,8 @@ It also includes a simple desktop calibration UI so non-engineers can tune per-f
 - Python 3.9+
 - Installed Python packages:
   - `requests`
+  - `fastapi`
+  - `uvicorn`
   - `pandas` (optional for downstream analysis, not required by extraction runtime)
 - A local `llama-server` binary from `llama.cpp`
 - A downloaded `.gguf` model
@@ -96,6 +98,44 @@ In the UI, you can:
 - Discover local GGUF models and select one
 - Refresh server models from `/v1/models` and choose one for calibration calls
 - Use setup helpers to install `llama.cpp` (macOS/Homebrew), download a recommended model, and start/stop `llama-server`
+
+Feature persistence:
+- The calibrator now auto-saves your workspace (including feature definitions/prompts) and auto-loads it on next launch.
+- Saved state path: `~/.echo_prompt_calibrator/calibrator_state.json`
+
+## 4c) Web calibration UI (new default for faster iteration)
+
+The web calibrator keeps the extraction logic in Python and adds a responsive local UI.
+
+Run both backend API and frontend in one command:
+
+```bash
+./scripts/run_calibrator_web.sh
+```
+
+This starts:
+- FastAPI backend at `http://127.0.0.1:8000`
+- React UI at `http://127.0.0.1:5173`
+
+If needed, run backend manually:
+
+```bash
+python -m uvicorn backend.scripts.calibrator_api.app:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Core API endpoints:
+- `POST /api/csv/load`
+- `POST /api/schema/load`
+- `POST /api/schema/save`
+- `POST /api/test/feature`
+- `POST /api/test/all`
+- `GET /api/jobs/{job_id}`
+- `POST /api/jobs/{job_id}/cancel`
+- `GET /api/health`
+
+Optional session endpoints:
+- `GET /api/session/load`
+- `POST /api/session/save`
 
 ## 5) Resume an interrupted run
 
