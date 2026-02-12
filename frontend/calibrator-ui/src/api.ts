@@ -1,5 +1,6 @@
 import type {
   CsvLoadResponse,
+  ExtractionJobResponse,
   JudgeConfig,
   Feature,
   FeatureTestResult,
@@ -16,6 +17,7 @@ import type {
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000";
 const REQUEST_TIMEOUT_MS = 15_000;
 const DOWNLOAD_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+const EXTRACTION_START_TIMEOUT_MS = 120_000;
 const ID_COLUMN_CANDIDATES = ["StudyID", "study_id", "id", "patient_id", "record_id"];
 const REPORT_COLUMN_CANDIDATES = ["Report", "report_text", "report", "report_body", "narrative"];
 
@@ -23,14 +25,26 @@ type ApiErrorShape = {
   error?: {
     code?: string;
     message?: string;
-    details?: unknown;
+    details?: {
+      reason?: string;
+      remediation?: string;
+      [key: string]: unknown;
+    } | unknown;
   };
 };
 
 async function readApiError(response: Response): Promise<string> {
   try {
     const payload = (await response.json()) as ApiErrorShape;
-    return payload.error?.message ?? `Request failed: ${response.status}`;
+    const message = payload.error?.message ?? `Request failed: ${response.status}`;
+    const details = payload.error?.details;
+    if (details && typeof details === "object" && "remediation" in details) {
+      const remediation = String((details as { remediation?: unknown }).remediation ?? "").trim();
+      if (remediation) {
+        return `${message} ${remediation}`;
+      }
+    }
+    return message;
   } catch {
     return `Request failed: ${response.status}`;
   }
@@ -493,7 +507,7 @@ export async function testAll(payload: {
 
 export async function testBatch(payload: {
   features: Feature[];
-  reports: Array<{ rowNumber: number | null; reportText: string }>;
+  reports: Array<{ rowNumber: number | null; studyId: string; reportText: string }>;
   llamaUrl: string;
   temperature: number;
   maxRetries: number;
@@ -521,6 +535,7 @@ export async function testBatch(payload: {
     features: payload.features,
     reports: payload.reports.map((report) => ({
       row_number: report.rowNumber,
+      study_id: report.studyId,
       report_text: report.reportText,
     })),
     llama_url: payload.llamaUrl,
@@ -556,6 +571,85 @@ export async function testBatch(payload: {
       },
     })),
   });
+}
+
+export async function runExtractionJob(payload: {
+  features: Feature[];
+  idColumn: string;
+  reportColumn: string;
+  csvPath: string;
+  outputName: string;
+  resume: boolean;
+  overwriteOutput: boolean;
+  writeRawResponse: boolean;
+  llamaUrl: string;
+  temperature: number;
+  maxRetries: number;
+  model: string;
+  experimentId: string;
+  experimentName: string;
+  systemInstructions: string;
+  extractionInstructions: string;
+  reasoningMode: ReasoningMode;
+  reasoningInstructions: string;
+  outputInstructions: string;
+  judge: JudgeConfig;
+}): Promise<{
+  job_id: string;
+  output_csv_path: string;
+  resume_mode: "fresh" | "resumed";
+  processed_rows_at_start: number;
+}> {
+  const body: Record<string, unknown> = {
+    features: payload.features,
+    input_csv_path: payload.csvPath,
+    id_column: payload.idColumn,
+    report_column: payload.reportColumn,
+    output_name: payload.outputName,
+    resume: payload.resume,
+    overwrite_output: payload.overwriteOutput,
+    write_raw_response: payload.writeRawResponse,
+    llama_url: payload.llamaUrl,
+    temperature: payload.temperature,
+    max_retries: payload.maxRetries,
+    model: payload.model,
+    experiment_id: payload.experimentId,
+    experiment_name: payload.experimentName,
+    system_instructions: payload.systemInstructions,
+    extraction_instructions: payload.extractionInstructions,
+    reasoning_mode: payload.reasoningMode,
+    reasoning_instructions: payload.reasoningInstructions,
+    output_instructions: payload.outputInstructions,
+    judge: {
+      enabled: payload.judge.enabled,
+      model: payload.judge.model,
+      instructions: payload.judge.instructions,
+      acceptance_threshold: payload.judge.acceptance_threshold,
+    },
+  };
+
+  return postJson<{
+    job_id: string;
+    output_csv_path: string;
+    resume_mode: "fresh" | "resumed";
+    processed_rows_at_start: number;
+  }>(
+    "/api/extract/v2/run",
+    body,
+    EXTRACTION_START_TIMEOUT_MS,
+  );
+}
+
+export async function getExtractionJob(jobId: string): Promise<ExtractionJobResponse> {
+  return getJson<ExtractionJobResponse>(`/api/extract/v2/jobs/${jobId}`);
+}
+
+export async function cancelExtractionJob(jobId: string): Promise<void> {
+  await postJson(`/api/extract/v2/jobs/${jobId}/cancel`, {});
+}
+
+export function getExtractionDownloadUrl(jobId: string): string {
+  return `${API_BASE}/api/extract/v2/jobs/${jobId}/download`;
 }
 
 export async function getJob(jobId: string): Promise<JobResponse> {

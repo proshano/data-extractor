@@ -215,6 +215,8 @@ class ExtractPipelineTests(unittest.TestCase):
 
         self.assertEqual(len(rows), 2)
         row_by_id = {row["record_id"]: row for row in rows}
+        self.assertEqual(row_by_id["1"]["study_id"], "1")
+        self.assertEqual(row_by_id["2"]["study_id"], "2")
         self.assertEqual(row_by_id["1"]["_status"], "ok")
         self.assertEqual(row_by_id["2"]["_status"], "llm_error")
         self.assertEqual(row_by_id["2"]["lvef_percent"], "NA")

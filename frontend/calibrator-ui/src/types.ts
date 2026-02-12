@@ -142,6 +142,7 @@ export type FeatureTestResult = {
   run_index?: number;
   report_index?: number;
   row_number?: number | null;
+  study_id?: string;
   experiment_id?: string;
   experiment_name?: string;
   judge_result?: JudgeResult | null;
@@ -151,6 +152,7 @@ export type ReportTestResult = {
   run_index?: number;
   report_index: number;
   row_number: number | null;
+  study_id?: string;
   report_text: string;
   experiment_id?: string;
   experiment_name?: string;
@@ -173,6 +175,30 @@ export type JobResponse = {
   results: FeatureTestResult[];
   report_results?: ReportTestResult[];
   last_result?: FeatureTestResult | null;
+  error: string;
+  cancel_requested: boolean;
+};
+
+export type ExtractionJobResponse = {
+  job_id: string;
+  status: "pending" | "running" | "completed" | "failed" | "cancelled";
+  total_rows: number | null;
+  processed_rows: number;
+  ok_rows: number;
+  error_rows: number;
+  elapsed_seconds: number;
+  rows_per_minute: number;
+  progress_percent: number | null;
+  last_source_row_number: number | null;
+  id_column: string;
+  report_column: string;
+  output_csv_path: string;
+  resume_mode?: "fresh" | "resumed";
+  processed_rows_at_start?: number;
+  created_at?: number;
+  updated_at?: number;
+  started_at?: number | null;
+  finished_at?: number | null;
   error: string;
   cancel_requested: boolean;
 };

@@ -204,6 +204,8 @@ def build_output_fieldnames(
     write_raw_response: bool,
 ) -> List[str]:
     fieldnames = [id_column] + [f["name"] for f in schema_features]
+    if id_column.lower() != "study_id":
+        fieldnames.insert(1, "study_id")
     fieldnames.extend(["_status", "_error", "_processed_at", "_model"])
     if write_raw_response:
         fieldnames.append("_raw_response")
@@ -227,6 +229,15 @@ def load_processed_ids(output_csv: Path, id_column: str) -> Set[str]:
         for row in reader:
             processed.add(str(row.get(id_column, "")).strip())
     return processed
+
+
+def load_existing_output_fieldnames(output_csv: Path) -> List[str]:
+    if not output_csv.exists() or output_csv.stat().st_size == 0:
+        return []
+
+    with output_csv.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        return list(reader.fieldnames or [])
 
 
 def sanitize_llm_text(text: str) -> str:
@@ -445,6 +456,8 @@ def build_error_row(
     raw_response: str,
 ) -> Dict[str, str]:
     row: Dict[str, str] = {id_column: record_id}
+    if id_column.lower() != "study_id":
+        row["study_id"] = record_id
     row.update(feature_defaults)
     row["_status"] = status
     row["_error"] = error
@@ -478,10 +491,15 @@ def run_extraction(args: argparse.Namespace) -> Dict[str, int]:
 
     processed_ids: Set[str] = set()
     append_mode = args.resume
+    existing_output_fieldnames: List[str] = []
     if args.resume and output_csv.exists():
         processed_ids = load_processed_ids(output_csv, args.id_column)
+        existing_output_fieldnames = load_existing_output_fieldnames(output_csv)
     elif not args.resume and output_csv.exists():
         output_csv.unlink()
+
+    if existing_output_fieldnames:
+        output_fieldnames = existing_output_fieldnames
 
     file_mode = "a" if append_mode and output_csv.exists() else "w"
     needs_header = not output_csv.exists() or output_csv.stat().st_size == 0 or file_mode == "w"
@@ -558,6 +576,8 @@ def run_extraction(args: argparse.Namespace) -> Dict[str, int]:
 
             feature_values = normalize_feature_values(parsed=parsed or {}, schema_features=schema_features)
             row = {args.id_column: record_id, **feature_values}
+            if args.id_column.lower() != "study_id":
+                row["study_id"] = record_id
             row["_status"] = "ok"
             row["_error"] = ""
             row["_processed_at"] = now_utc_iso()

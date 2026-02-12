@@ -1,4 +1,6 @@
 import base64
+import csv
+import os
 import tempfile
 import time
 import unittest
@@ -16,6 +18,13 @@ try:
 except Exception:
     FASTAPI_AVAILABLE = False
 
+if FASTAPI_AVAILABLE:
+    try:
+        _probe_client = TestClient(app)
+        _probe_client.close()
+    except Exception:
+        FASTAPI_AVAILABLE = False
+
 
 class CsvServiceTests(unittest.TestCase):
     def test_parse_csv_base64_infers_columns(self):
@@ -29,6 +38,36 @@ class CsvServiceTests(unittest.TestCase):
         self.assertEqual(result["inferred_id_column"], "StudyID")
         self.assertEqual(result["inferred_report_column"], "Report")
         self.assertEqual(len(result["preview"]), 2)
+
+    def test_open_csv_stream_reads_headers_without_materializing_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "input.csv"
+            csv_path.write_text(
+                "StudyID,Report\n1,First report\n2,Second report\n",
+                encoding="utf-8",
+            )
+
+            with csv_service.open_csv_stream(csv_path) as (headers, row_iterator, encoding, delimiter):
+                self.assertEqual(headers, ["StudyID", "Report"])
+                self.assertEqual(encoding, "utf-8-sig")
+                self.assertEqual(delimiter, ",")
+                self.assertFalse(isinstance(row_iterator, list))
+                first_row = next(row_iterator)
+                self.assertEqual(first_row["StudyID"], "1")
+                self.assertEqual(first_row["Report"], "First report")
+
+    def test_read_csv_headers_returns_columns_only(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "sample.csv"
+            csv_path.write_text(
+                "record_id;report_text\n1;ok\n",
+                encoding="utf-8",
+            )
+
+            payload = csv_service.read_csv_headers(csv_path)
+
+            self.assertEqual(payload["columns"], ["record_id", "report_text"])
+            self.assertEqual(payload["delimiter"], ";")
 
 
 class SchemaServiceTests(unittest.TestCase):
@@ -520,8 +559,8 @@ class ApiTests(unittest.TestCase):
                         }
                     ],
                     "reports": [
-                        {"row_number": 1, "report_text": "RV function appears normal."},
-                        {"row_number": 2, "report_text": "RV function is mildly reduced."},
+                        {"row_number": 1, "study_id": "S1", "report_text": "RV function appears normal."},
+                        {"row_number": 2, "study_id": "S2", "report_text": "RV function is mildly reduced."},
                     ],
                     "llama_url": "http://127.0.0.1:8080",
                 },
@@ -544,6 +583,449 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(last_payload.get("reports_total"), 2)
         self.assertEqual(last_payload.get("reports_completed"), 2)
         self.assertEqual(len(last_payload.get("report_results", [])), 2)
+        self.assertEqual(last_payload["report_results"][0]["study_id"], "S1")
+        self.assertEqual(last_payload["report_results"][1]["study_id"], "S2")
+        self.assertEqual(last_payload["report_results"][0]["results"][0]["study_id"], "S1")
+        self.assertEqual(last_payload["report_results"][1]["results"][0]["study_id"], "S2")
+
+    def test_extract_run_job_lifecycle_and_download(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_csv_path = Path(temp_dir) / "reports.csv"
+            output_csv_path = Path(temp_dir) / "extracted.csv"
+            input_csv_path.write_text(
+                "StudyID,Report\n1,RV function appears normal.\n2,RV function appears normal.\n",
+                encoding="utf-8",
+            )
+
+            with patch(
+                "backend.scripts.extract_pipeline.call_llamacpp_with_retries",
+                return_value={
+                    "success": True,
+                    "content": '{"value":"normal"}',
+                    "error": "",
+                    "model": "fake-model",
+                },
+            ):
+                start_response = self.client.post(
+                    "/api/extract/run",
+                    json={
+                        "features": [
+                            {
+                                "name": "rv_function",
+                                "description": "RV function",
+                                "allowed_values": ["normal", "reduced", "NA"],
+                                "missing_value_rule": "NA",
+                                "prompt": "Use explicit words only.",
+                            }
+                        ],
+                        "id_column": "StudyID",
+                        "report_column": "Report",
+                        "path": str(input_csv_path),
+                        "output_csv_path": str(output_csv_path),
+                        "llama_url": "http://127.0.0.1:8080",
+                    },
+                )
+
+                self.assertEqual(start_response.status_code, 200)
+                payload = start_response.json()
+                job_id = payload["job_id"]
+                self.assertEqual(payload["output_csv_path"], str(output_csv_path))
+
+                deadline = time.time() + 5
+                job_payload = {}
+                while time.time() < deadline:
+                    poll_response = self.client.get(f"/api/extract/jobs/{job_id}")
+                    self.assertEqual(poll_response.status_code, 200)
+                    job_payload = poll_response.json()
+                    if job_payload["status"] in {"completed", "failed", "cancelled"}:
+                        break
+                    time.sleep(0.05)
+
+                self.assertEqual(job_payload.get("status"), "completed")
+                self.assertEqual(job_payload.get("total_rows"), 2)
+                self.assertEqual(job_payload.get("completed_rows"), 2)
+                self.assertEqual(job_payload.get("ok_rows"), 2)
+                self.assertTrue(output_csv_path.exists())
+
+                download_response = self.client.get(f"/api/extract/jobs/{job_id}/download")
+                self.assertEqual(download_response.status_code, 200)
+                downloaded_text = download_response.content.decode("utf-8")
+                self.assertIn("rv_function", downloaded_text)
+                self.assertIn("normal", downloaded_text)
+
+    def test_extract_v2_run_job_lifecycle_and_download(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_csv_path = Path(temp_dir) / "reports.csv"
+            export_root = Path(temp_dir) / "exports"
+            input_csv_path.write_text(
+                "StudyID,Report\n1,RV function appears normal.\n2,RV function appears normal.\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"CALIBRATOR_EXPORT_ROOT": str(export_root)}), patch(
+                "backend.scripts.extract_pipeline.call_llamacpp_with_retries",
+                return_value={
+                    "success": True,
+                    "content": '{"value":"normal"}',
+                    "error": "",
+                    "model": "fake-model",
+                },
+            ):
+                start_response = self.client.post(
+                    "/api/extract/v2/run",
+                    json={
+                        "features": [
+                            {
+                                "name": "rv_function",
+                                "description": "RV function",
+                                "allowed_values": ["normal", "reduced", "NA"],
+                                "missing_value_rule": "NA",
+                                "prompt": "Use explicit words only.",
+                            }
+                        ],
+                        "input_csv_path": str(input_csv_path),
+                        "id_column": "StudyID",
+                        "report_column": "Report",
+                        "output_name": "v2_run_output",
+                        "resume": True,
+                        "overwrite_output": False,
+                        "llama_url": "http://127.0.0.1:8080",
+                    },
+                )
+
+                self.assertEqual(start_response.status_code, 200)
+                payload = start_response.json()
+                job_id = payload["job_id"]
+                self.assertEqual(payload["resume_mode"], "fresh")
+                self.assertEqual(payload["processed_rows_at_start"], 0)
+                self.assertTrue(str(payload["output_csv_path"]).startswith(str(export_root)))
+
+                deadline = time.time() + 5
+                job_payload = {}
+                while time.time() < deadline:
+                    poll_response = self.client.get(f"/api/extract/v2/jobs/{job_id}")
+                    self.assertEqual(poll_response.status_code, 200)
+                    job_payload = poll_response.json()
+                    if job_payload["status"] in {"completed", "failed", "cancelled"}:
+                        break
+                    time.sleep(0.05)
+
+                self.assertEqual(job_payload.get("status"), "completed")
+                self.assertEqual(job_payload.get("processed_rows"), 2)
+                self.assertEqual(job_payload.get("ok_rows"), 2)
+                self.assertEqual(job_payload.get("total_rows"), 2)
+                self.assertEqual(job_payload.get("progress_percent"), 100)
+
+                download_response = self.client.get(f"/api/extract/v2/jobs/{job_id}/download")
+                self.assertEqual(download_response.status_code, 200)
+                downloaded_text = download_response.content.decode("utf-8")
+                self.assertIn("rv_function", downloaded_text)
+                self.assertIn("normal", downloaded_text)
+                self.assertIn("study_id", downloaded_text)
+                self.assertIn("\n1,1,", downloaded_text)
+                self.assertIn("\n2,2,", downloaded_text)
+
+    def test_extract_v2_cancel_mid_run_keeps_partial_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_csv_path = Path(temp_dir) / "reports.csv"
+            export_root = Path(temp_dir) / "exports"
+            rows = ["StudyID,Report"]
+            for idx in range(1, 81):
+                rows.append(f"{idx},RV function appears normal.")
+            input_csv_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+            def slow_llm(*_args, **_kwargs):
+                time.sleep(0.02)
+                return {
+                    "success": True,
+                    "content": '{"value":"normal"}',
+                    "error": "",
+                    "model": "fake-model",
+                }
+
+            with patch.dict(os.environ, {"CALIBRATOR_EXPORT_ROOT": str(export_root)}), patch(
+                "backend.scripts.extract_pipeline.call_llamacpp_with_retries",
+                side_effect=slow_llm,
+            ):
+                start_response = self.client.post(
+                    "/api/extract/v2/run",
+                    json={
+                        "features": [
+                            {
+                                "name": "rv_function",
+                                "description": "RV function",
+                                "allowed_values": ["normal", "reduced", "NA"],
+                                "missing_value_rule": "NA",
+                                "prompt": "Use explicit words only.",
+                            }
+                        ],
+                        "input_csv_path": str(input_csv_path),
+                        "id_column": "StudyID",
+                        "report_column": "Report",
+                        "output_name": "v2_cancel_output",
+                        "resume": True,
+                        "overwrite_output": False,
+                        "llama_url": "http://127.0.0.1:8080",
+                    },
+                )
+                self.assertEqual(start_response.status_code, 200)
+                payload = start_response.json()
+                job_id = payload["job_id"]
+                output_csv_path = Path(payload["output_csv_path"])
+
+                cancel_sent = False
+                deadline = time.time() + 10
+                final_payload = {}
+                while time.time() < deadline:
+                    poll_response = self.client.get(f"/api/extract/v2/jobs/{job_id}")
+                    self.assertEqual(poll_response.status_code, 200)
+                    final_payload = poll_response.json()
+
+                    if (
+                        not cancel_sent
+                        and final_payload["status"] == "running"
+                        and int(final_payload.get("processed_rows", 0)) >= 5
+                    ):
+                        cancel_response = self.client.post(f"/api/extract/v2/jobs/{job_id}/cancel")
+                        self.assertEqual(cancel_response.status_code, 200)
+                        cancel_sent = True
+
+                    if final_payload["status"] in {"completed", "failed", "cancelled"}:
+                        break
+                    time.sleep(0.05)
+
+                self.assertTrue(cancel_sent)
+                self.assertEqual(final_payload.get("status"), "cancelled")
+                processed_rows = int(final_payload.get("processed_rows", 0))
+                self.assertGreater(processed_rows, 0)
+                self.assertLess(processed_rows, 80)
+                self.assertTrue(output_csv_path.exists())
+                with output_csv_path.open("r", encoding="utf-8", newline="") as handle:
+                    output_rows = list(csv.DictReader(handle))
+                self.assertEqual(len(output_rows), processed_rows)
+
+    def test_extract_v2_resume_from_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_csv_path = Path(temp_dir) / "reports.csv"
+            export_root = Path(temp_dir) / "exports"
+            rows = ["StudyID,Report"]
+            for idx in range(1, 13):
+                rows.append(f"{idx},RV function appears normal.")
+            input_csv_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+            def slow_llm(*_args, **_kwargs):
+                time.sleep(0.02)
+                return {
+                    "success": True,
+                    "content": '{"value":"normal"}',
+                    "error": "",
+                    "model": "fake-model",
+                }
+
+            with patch.dict(os.environ, {"CALIBRATOR_EXPORT_ROOT": str(export_root)}), patch(
+                "backend.scripts.extract_pipeline.call_llamacpp_with_retries",
+                side_effect=slow_llm,
+            ):
+                start_response = self.client.post(
+                    "/api/extract/v2/run",
+                    json={
+                        "features": [
+                            {
+                                "name": "rv_function",
+                                "description": "RV function",
+                                "allowed_values": ["normal", "reduced", "NA"],
+                                "missing_value_rule": "NA",
+                                "prompt": "Use explicit words only.",
+                            }
+                        ],
+                        "input_csv_path": str(input_csv_path),
+                        "id_column": "StudyID",
+                        "report_column": "Report",
+                        "output_name": "v2_resume_output",
+                        "resume": True,
+                        "overwrite_output": False,
+                        "llama_url": "http://127.0.0.1:8080",
+                    },
+                )
+                self.assertEqual(start_response.status_code, 200)
+                first_job_id = start_response.json()["job_id"]
+
+                partial_processed = 0
+                cancel_sent = False
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    poll_response = self.client.get(f"/api/extract/v2/jobs/{first_job_id}")
+                    self.assertEqual(poll_response.status_code, 200)
+                    first_payload = poll_response.json()
+
+                    partial_processed = int(first_payload.get("processed_rows", 0))
+                    if not cancel_sent and first_payload["status"] == "running" and partial_processed >= 3:
+                        cancel_response = self.client.post(f"/api/extract/v2/jobs/{first_job_id}/cancel")
+                        self.assertEqual(cancel_response.status_code, 200)
+                        cancel_sent = True
+
+                    if first_payload["status"] in {"completed", "failed", "cancelled"}:
+                        break
+                    time.sleep(0.05)
+
+                self.assertTrue(cancel_sent)
+
+                resume_response = self.client.post(
+                    "/api/extract/v2/run",
+                    json={
+                        "features": [
+                            {
+                                "name": "rv_function",
+                                "description": "RV function",
+                                "allowed_values": ["normal", "reduced", "NA"],
+                                "missing_value_rule": "NA",
+                                "prompt": "Use explicit words only.",
+                            }
+                        ],
+                        "input_csv_path": str(input_csv_path),
+                        "id_column": "StudyID",
+                        "report_column": "Report",
+                        "output_name": "v2_resume_output",
+                        "resume": True,
+                        "overwrite_output": False,
+                        "llama_url": "http://127.0.0.1:8080",
+                    },
+                )
+                self.assertEqual(resume_response.status_code, 200)
+                resume_payload = resume_response.json()
+                self.assertEqual(resume_payload["resume_mode"], "resumed")
+                self.assertEqual(resume_payload["processed_rows_at_start"], partial_processed)
+                second_job_id = resume_payload["job_id"]
+                output_csv_path = Path(resume_payload["output_csv_path"])
+
+                deadline = time.time() + 10
+                second_payload = {}
+                while time.time() < deadline:
+                    poll_response = self.client.get(f"/api/extract/v2/jobs/{second_job_id}")
+                    self.assertEqual(poll_response.status_code, 200)
+                    second_payload = poll_response.json()
+                    if second_payload["status"] in {"completed", "failed", "cancelled"}:
+                        break
+                    time.sleep(0.05)
+
+                self.assertEqual(second_payload.get("status"), "completed")
+                self.assertEqual(second_payload.get("processed_rows"), 12)
+                self.assertEqual(second_payload.get("total_rows"), 12)
+                with output_csv_path.open("r", encoding="utf-8", newline="") as handle:
+                    rows = list(csv.DictReader(handle))
+                self.assertEqual(len(rows), 12)
+
+    def test_extract_v2_conflict_on_incompatible_resume_context(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_csv_path = Path(temp_dir) / "reports.csv"
+            export_root = Path(temp_dir) / "exports"
+            input_csv_path.write_text(
+                "StudyID,Report\n1,RV function appears normal.\n2,RV function appears normal.\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"CALIBRATOR_EXPORT_ROOT": str(export_root)}), patch(
+                "backend.scripts.extract_pipeline.call_llamacpp_with_retries",
+                return_value={
+                    "success": True,
+                    "content": '{"value":"normal"}',
+                    "error": "",
+                    "model": "fake-model",
+                },
+            ):
+                first_response = self.client.post(
+                    "/api/extract/v2/run",
+                    json={
+                        "features": [
+                            {
+                                "name": "rv_function",
+                                "description": "RV function",
+                                "allowed_values": ["normal", "reduced", "NA"],
+                                "missing_value_rule": "NA",
+                                "prompt": "Use explicit words only.",
+                            }
+                        ],
+                        "input_csv_path": str(input_csv_path),
+                        "id_column": "StudyID",
+                        "report_column": "Report",
+                        "output_name": "v2_conflict_output",
+                        "resume": True,
+                        "overwrite_output": False,
+                        "llama_url": "http://127.0.0.1:8080",
+                    },
+                )
+                self.assertEqual(first_response.status_code, 200)
+                first_job_id = first_response.json()["job_id"]
+
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    poll_response = self.client.get(f"/api/extract/v2/jobs/{first_job_id}")
+                    self.assertEqual(poll_response.status_code, 200)
+                    if poll_response.json()["status"] in {"completed", "failed", "cancelled"}:
+                        break
+                    time.sleep(0.05)
+
+                second_response = self.client.post(
+                    "/api/extract/v2/run",
+                    json={
+                        "features": [
+                            {
+                                "name": "different_feature",
+                                "description": "Another feature",
+                                "allowed_values": ["yes", "no", "NA"],
+                                "missing_value_rule": "NA",
+                                "prompt": "Return yes/no only.",
+                            }
+                        ],
+                        "input_csv_path": str(input_csv_path),
+                        "id_column": "StudyID",
+                        "report_column": "Report",
+                        "output_name": "v2_conflict_output",
+                        "resume": True,
+                        "overwrite_output": False,
+                        "llama_url": "http://127.0.0.1:8080",
+                    },
+                )
+
+                self.assertEqual(second_response.status_code, 409)
+                payload = second_response.json()
+                self.assertEqual(payload["error"]["code"], "v2_resume_conflict")
+                self.assertIn("remediation", payload["error"]["details"])
+
+    def test_extract_v2_rejects_output_name_traversal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_csv_path = Path(temp_dir) / "reports.csv"
+            export_root = Path(temp_dir) / "exports"
+            input_csv_path.write_text(
+                "StudyID,Report\n1,RV function appears normal.\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"CALIBRATOR_EXPORT_ROOT": str(export_root)}):
+                response = self.client.post(
+                    "/api/extract/v2/run",
+                    json={
+                        "features": [
+                            {
+                                "name": "rv_function",
+                                "description": "RV function",
+                                "allowed_values": ["normal", "reduced", "NA"],
+                                "missing_value_rule": "NA",
+                                "prompt": "Use explicit words only.",
+                            }
+                        ],
+                        "input_csv_path": str(input_csv_path),
+                        "id_column": "StudyID",
+                        "report_column": "Report",
+                        "output_name": "../escape",
+                        "resume": True,
+                        "overwrite_output": False,
+                        "llama_url": "http://127.0.0.1:8080",
+                    },
+                )
+
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.json()["error"]["code"], "invalid_output_name")
 
 
 if __name__ == "__main__":

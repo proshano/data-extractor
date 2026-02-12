@@ -2,9 +2,12 @@ import { type ChangeEvent, type KeyboardEvent, useEffect, useMemo, useRef, useSt
 import { useMutation, useQuery } from "@tanstack/react-query";
 
 import {
+  cancelExtractionJob,
   cancelJob,
   downloadGgufModel,
   ensureLlamaServer,
+  getExtractionDownloadUrl,
+  getExtractionJob,
   getJob,
   healthCheck,
   listGgufFiles,
@@ -17,11 +20,13 @@ import {
   saveSession,
   stopLlamaServer,
   stopLlamaServerOnPageUnload,
+  runExtractionJob,
   testBatch,
   testFeature,
 } from "./api";
 import type {
   CsvLoadResponse,
+  ExtractionJobResponse,
   ExperimentProfile,
   Feature,
   FeatureTestResult,
@@ -79,7 +84,7 @@ const DEFAULT_SESSION: SessionState = {
   active_experiment_ids: [DEFAULT_EXPERIMENT.id],
 };
 
-type TabKey = "setup" | "schema" | "experiments" | "test";
+type TabKey = "setup" | "schema" | "experiments" | "test" | "production";
 type ToastKind = "success" | "error" | "info";
 
 type Toast = {
@@ -90,6 +95,7 @@ type Toast = {
 
 type BatchReportItem = {
   rowNumber: number | null;
+  studyId: string;
   reportText: string;
 };
 
@@ -302,18 +308,22 @@ function formatModelSize(sizeGb: number | null): string {
   return `${sizeGb.toFixed(2)} GB`;
 }
 
-function resolveReportTextFromValues(values: Record<string, string>, reportColumn: string): string {
-  if (values[reportColumn] !== undefined) {
-    return values[reportColumn] ?? "";
+function resolveColumnValueFromValues(values: Record<string, string>, columnName: string): string {
+  if (values[columnName] !== undefined) {
+    return values[columnName] ?? "";
   }
 
   const matchedColumn = Object.keys(values).find(
-    (column) => column.toLowerCase() === reportColumn.toLowerCase(),
+    (column) => column.toLowerCase() === columnName.toLowerCase(),
   );
   if (!matchedColumn) {
     return "";
   }
   return values[matchedColumn] ?? "";
+}
+
+function resolveReportTextFromValues(values: Record<string, string>, reportColumn: string): string {
+  return resolveColumnValueFromValues(values, reportColumn);
 }
 
 function truncateText(value: string, limit: number): string {
@@ -548,6 +558,7 @@ function App() {
   const [csvData, setCsvData] = useState<CsvLoadResponse | null>(null);
   const [previewRows, setPreviewRows] = useState(8);
   const [selectedFileName, setSelectedFileName] = useState("");
+  const [selectedCsvFile, setSelectedCsvFile] = useState<File | null>(null);
   const [selectedFeatureIndex, setSelectedFeatureIndex] = useState(0);
   const [selectedExperimentIndex, setSelectedExperimentIndex] = useState(0);
   const [localModelPaths, setLocalModelPaths] = useState<string[]>([]);
@@ -568,6 +579,14 @@ function App() {
   const [singleResult, setSingleResult] = useState<FeatureTestResult | null>(null);
   const [jobId, setJobId] = useState<string>("");
   const [lastJobStatus, setLastJobStatus] = useState<string>("");
+  const [extractionJobId, setExtractionJobId] = useState<string>("");
+  const [lastExtractionJobStatus, setLastExtractionJobStatus] = useState<string>("");
+  const [extractionOutputPath, setExtractionOutputPath] = useState("");
+  const [extractionOutputName, setExtractionOutputName] = useState("");
+  const [extractionResumeEnabled, setExtractionResumeEnabled] = useState(true);
+  const [extractionResumeMode, setExtractionResumeMode] = useState<"" | "fresh" | "resumed">("");
+  const [extractionProcessedRowsAtStart, setExtractionProcessedRowsAtStart] = useState(0);
+  const [overwriteExtractionOutput, setOverwriteExtractionOutput] = useState(false);
   const [reportsToTest, setReportsToTest] = useState(5);
   const [requestedBatchSize, setRequestedBatchSize] = useState(1);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -603,9 +622,24 @@ function App() {
     },
   });
 
+  const extractionJobQuery = useQuery({
+    queryKey: ["extraction-job", extractionJobId],
+    queryFn: () => getExtractionJob(extractionJobId),
+    enabled: Boolean(extractionJobId),
+    refetchInterval: (query) => {
+      const data = query.state.data as ExtractionJobResponse | undefined;
+      if (!data) {
+        return 1000;
+      }
+      return data.status === "pending" || data.status === "running" ? 1000 : false;
+    },
+  });
+
   const loadCsvByPathMutation = useMutation({
     mutationFn: loadCsvFromPath,
     onSuccess: (data) => {
+      setSelectedCsvFile(null);
+      setSelectedFileName("");
       setCsvData(data);
       setSession((prev) => ({
         ...prev,
@@ -638,7 +672,7 @@ function App() {
       setCsvData(data);
       setSession((prev) => ({
         ...prev,
-        csv_path: data.source,
+        csv_path: "",
         csv_cache: data,
         id_column: data.inferred_id_column || prev.id_column,
         report_column: data.inferred_report_column || prev.report_column,
@@ -839,6 +873,37 @@ function App() {
     },
   });
 
+  const runExtractionMutation = useMutation({
+    mutationFn: runExtractionJob,
+    onSuccess: (data) => {
+      setExtractionJobId(data.job_id);
+      setLastExtractionJobStatus("");
+      setExtractionOutputPath(data.output_csv_path);
+      setExtractionResumeMode(data.resume_mode);
+      setExtractionProcessedRowsAtStart(data.processed_rows_at_start);
+      addToast(
+        data.resume_mode === "resumed"
+          ? `Resumed extraction from row ${data.processed_rows_at_start + 1}.`
+          : "Started full extraction job.",
+        "info",
+      );
+    },
+    onError: (error: Error) => {
+      addToast(error.message, "error");
+    },
+  });
+
+  const cancelExtractionMutation = useMutation({
+    mutationFn: cancelExtractionJob,
+    onSuccess: () => {
+      addToast("Extraction cancellation requested.", "info");
+      void extractionJobQuery.refetch();
+    },
+    onError: (error: Error) => {
+      addToast(error.message, "error");
+    },
+  });
+
   const selectedExperiment = session.experiment_profiles[selectedExperimentIndex] ?? null;
   const activeExperiment = useMemo(() => {
     const profileById = session.experiment_profiles.find(
@@ -883,6 +948,12 @@ function App() {
     () => hfRepoFiles.find((file) => file.file_name === selectedHfFile) ?? null,
     [hfRepoFiles, selectedHfFile],
   );
+  const isLlamaServerStopped = llamaStatus?.process_running === false;
+  const stopLlamaButtonLabel = stopLlamaMutation.isPending
+    ? "Stopping server..."
+    : isLlamaServerStopped
+      ? "Server stopped"
+      : "Stop local server";
   const availableJudgeModels = useMemo(() => {
     const deduped = new Set<string>();
     for (const model of llamaStatus?.server_models ?? []) {
@@ -920,6 +991,7 @@ function App() {
   const availableColumns = csvData?.columns ?? [];
   const idColumnSelectValue = availableColumns.includes(session.id_column) ? session.id_column : "";
   const reportColumnSelectValue = availableColumns.includes(session.report_column) ? session.report_column : "";
+  const resolvedStudyIdColumn = session.id_column.trim() || csvData?.inferred_id_column || "";
   const safeSampleIndex = Math.max(1, Math.min(session.sample_index || 1, Math.max(sampleRows.length, 1)));
 
   const selectedSampleRow = useMemo(() => {
@@ -938,6 +1010,9 @@ function App() {
         .slice(startIndex, startIndex + safeReportsToTest)
         .map((row) => ({
           rowNumber: row.row_number,
+          studyId:
+            resolveColumnValueFromValues(row.values, resolvedStudyIdColumn).trim() ||
+            `row_${row.row_number}`,
           reportText: resolveReportTextFromValues(row.values, session.report_column).trim(),
         }))
         .filter((row) => row.reportText.length > 0);
@@ -951,8 +1026,8 @@ function App() {
       return [];
     }
 
-    return [{ rowNumber: null, reportText: reportText.trim() }];
-  }, [sampleRows, safeSampleIndex, safeReportsToTest, session.report_column, reportText]);
+    return [{ rowNumber: null, studyId: "", reportText: reportText.trim() }];
+  }, [sampleRows, safeSampleIndex, safeReportsToTest, resolvedStudyIdColumn, session.report_column, reportText]);
 
   useEffect(() => {
     if (!sessionQuery.data || sessionLoaded) {
@@ -1038,6 +1113,23 @@ function App() {
       addToast("Feature run cancelled.", "info");
     }
   }, [jobQuery.data?.status]);
+
+  useEffect(() => {
+    const status = extractionJobQuery.data?.status;
+    if (!status || status === lastExtractionJobStatus) {
+      return;
+    }
+    setLastExtractionJobStatus(status);
+    if (status === "completed") {
+      addToast("Extraction job completed.", "success");
+    }
+    if (status === "failed") {
+      addToast(extractionJobQuery.data?.error || "Extraction job failed.", "error");
+    }
+    if (status === "cancelled") {
+      addToast("Extraction job cancelled.", "info");
+    }
+  }, [extractionJobQuery.data?.status]);
 
   useEffect(() => {
     const currentJob = jobQuery.data;
@@ -1393,10 +1485,12 @@ function App() {
     const file = event.target.files?.[0] ?? null;
     if (!file) {
       setSelectedFileName("");
+      setSelectedCsvFile(null);
       return;
     }
 
     setSelectedFileName(file.name);
+    setSelectedCsvFile(file);
     loadCsvByFileMutation.mutate({
       file,
       previewRows,
@@ -1606,6 +1700,10 @@ function App() {
   }
 
   function handleStopLlamaServer(): void {
+    if (llamaStatus?.process_running === false) {
+      addToast("Local model server is already stopped.", "info");
+      return;
+    }
     const currentLlamaUrl = llamaStatus?.llama_url || `http://127.0.0.1:${llamaPort}`;
     stopLlamaMutation.mutate({ llamaUrl: currentLlamaUrl });
   }
@@ -1726,6 +1824,92 @@ function App() {
     }
   }
 
+  async function handleRunExtractionJob(): Promise<void> {
+    if (session.features.length === 0) {
+      addToast("Define at least one feature.", "error");
+      return;
+    }
+    if (!activeExperiment) {
+      addToast("Create an experiment profile first.", "error");
+      return;
+    }
+    const idColumn = session.id_column.trim();
+    const reportColumn = session.report_column.trim();
+    if (!idColumn) {
+      addToast("Select an ID column first.", "error");
+      return;
+    }
+    if (!reportColumn) {
+      addToast("Select a report column first.", "error");
+      return;
+    }
+
+    const sourcePath = session.csv_path.trim();
+    if (!sourcePath) {
+      addToast("Production extraction requires a CSV path on disk. Use Load CSV from path first.", "error");
+      return;
+    }
+
+    const ready = await ensureLlamaReady();
+    if (!ready) {
+      return;
+    }
+
+    try {
+      const resolvedJudge = resolveJudgeConfigForRun(activeExperiment.judge);
+      if (activeExperiment.judge.enabled && !resolvedJudge.enabled) {
+        addToast("Judge pass enabled but no judge model selected. Judge is skipped.", "info");
+      }
+      const response = await runExtractionMutation.mutateAsync({
+        features: session.features,
+        idColumn,
+        reportColumn,
+        csvPath: sourcePath,
+        outputName: extractionOutputName.trim(),
+        resume: extractionResumeEnabled,
+        overwriteOutput: overwriteExtractionOutput,
+        writeRawResponse: false,
+        llamaUrl: `http://127.0.0.1:${llamaPort}`,
+        temperature: session.temperature,
+        maxRetries: session.max_retries,
+        model: "",
+        experimentId: activeExperiment.id,
+        experimentName: activeExperiment.name,
+        systemInstructions: activeExperiment.system_instructions,
+        extractionInstructions: activeExperiment.extraction_instructions,
+        reasoningMode: activeExperiment.reasoning_mode,
+        reasoningInstructions: activeExperiment.reasoning_instructions,
+        outputInstructions: activeExperiment.output_instructions,
+        judge: resolvedJudge,
+      });
+      setExtractionOutputPath(response.output_csv_path);
+      setExtractionResumeMode(response.resume_mode);
+      setExtractionProcessedRowsAtStart(response.processed_rows_at_start);
+    } catch {
+      // Error toast is handled by mutation onError.
+    }
+  }
+
+  function handleDownloadExtractionCsv(): void {
+    const extractionJob = extractionJobQuery.data;
+    if (!extractionJobId || !extractionJob) {
+      addToast("Run extraction first to produce an output CSV.", "error");
+      return;
+    }
+
+    if (!["completed", "cancelled"].includes(extractionJob.status)) {
+      addToast("Wait for extraction to finish before downloading CSV.", "info");
+      return;
+    }
+
+    const link = document.createElement("a");
+    link.href = getExtractionDownloadUrl(extractionJobId);
+    link.download = "";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
   function handleExportRunCsv(): void {
     const currentJob = jobQuery.data;
     if (!currentJob) {
@@ -1733,61 +1917,94 @@ function App() {
       return;
     }
 
-    const rows: Array<Record<string, unknown>> = [];
-    const reportItems = currentJob.report_results ?? [];
+    const hasStructuredReports = (currentJob.report_results ?? []).length > 0;
+    const hasFlatResults = (currentJob.results ?? []).length > 0;
+    if (!hasStructuredReports && !hasFlatResults) {
+      addToast("No run results available to export.", "error");
+      return;
+    }
 
-    if (reportItems.length > 0) {
-      for (const reportItem of reportItems) {
-        for (const result of reportItem.results ?? []) {
-          rows.push({
-            job_id: currentJob.job_id,
-            run_index: result.run_index ?? reportItem.run_index ?? "",
-            report_index: result.report_index ?? reportItem.report_index ?? "",
-            row_number: result.row_number ?? reportItem.row_number ?? "",
-            experiment_id:
-              String(result.experiment_id ?? "").trim() || String(reportItem.experiment_id ?? "").trim(),
-            experiment_name:
-              String(result.experiment_name ?? "").trim() || String(reportItem.experiment_name ?? "").trim(),
-            feature_name: result.feature_name,
-            status: result.status,
-            value: result.value,
-            duration_ms: result.duration_ms,
-            model: result.model,
-            error: result.error,
-            judge_status: result.judge_result?.status ?? "",
-            judge_verdict: result.judge_result?.verdict ?? "",
-            judge_score: result.judge_result?.score ?? "",
-            judge_rationale: result.judge_result?.rationale ?? "",
-            judge_model: result.judge_result?.model ?? "",
-            judge_error: result.judge_result?.error ?? "",
-            report_text: reportItem.report_text ?? "",
-          });
+    const featureColumns = new Set<string>();
+    for (const feature of session.features) {
+      const featureName = String(feature.name ?? "").trim();
+      if (featureName) {
+        featureColumns.add(featureName);
+      }
+    }
+
+    const fallbackStudyId =
+      selectedSampleRow && resolvedStudyIdColumn
+        ? resolveColumnValueFromValues(selectedSampleRow.values, resolvedStudyIdColumn).trim()
+        : "";
+
+    const reportItems =
+      hasStructuredReports
+        ? currentJob.report_results ?? []
+        : [
+            {
+              run_index: 1,
+              report_index: 1,
+              row_number: selectedSampleRow?.row_number ?? null,
+              study_id:
+                fallbackStudyId ||
+                (selectedSampleRow?.row_number ? `row_${selectedSampleRow.row_number}` : ""),
+              report_text: reportText,
+              experiment_id: activeExperiment?.id ?? "",
+              experiment_name: activeExperiment?.name ?? "",
+              results: currentJob.results ?? [],
+            },
+          ];
+
+    const rows: Array<Record<string, unknown>> = [];
+    for (const reportItem of reportItems) {
+      const rawRowNumber = reportItem.row_number;
+      const rowNumber =
+        typeof rawRowNumber === "number" && Number.isFinite(rawRowNumber) ? rawRowNumber : "";
+      const studyId =
+        String(reportItem.study_id ?? "").trim() ||
+        (typeof rawRowNumber === "number" && Number.isFinite(rawRowNumber) ? `row_${rawRowNumber}` : "");
+
+      const row: Record<string, unknown> = {
+        job_id: currentJob.job_id,
+        run_index: reportItem.run_index ?? "",
+        report_index: reportItem.report_index ?? "",
+        row_number: rowNumber,
+        study_id: studyId,
+        experiment_id: String(reportItem.experiment_id ?? "").trim(),
+        experiment_name: String(reportItem.experiment_name ?? "").trim(),
+        row_status: "ok",
+        row_error_count: 0,
+        row_errors: "",
+        report_text: reportItem.report_text ?? "",
+      };
+
+      const rowErrors: string[] = [];
+      let rowStatus: "ok" | "llm_error" | "parse_error" = "ok";
+      for (const result of reportItem.results ?? []) {
+        const featureName = String(result.feature_name ?? "").trim();
+        if (!featureName) {
+          continue;
+        }
+
+        featureColumns.add(featureName);
+        row[featureName] = result.value ?? "";
+
+        const status = String(result.status ?? "").trim();
+        if (status && status !== "ok") {
+          const errorDetail = String(result.error ?? "").trim() || status;
+          rowErrors.push(`${featureName}:${errorDetail}`);
+          if (status === "parse_error") {
+            rowStatus = "parse_error";
+          } else if (rowStatus === "ok") {
+            rowStatus = "llm_error";
+          }
         }
       }
-    } else {
-      for (const result of currentJob.results ?? []) {
-        rows.push({
-          job_id: currentJob.job_id,
-          run_index: result.run_index ?? "",
-          report_index: result.report_index ?? "",
-          row_number: result.row_number ?? "",
-          experiment_id: result.experiment_id ?? "",
-          experiment_name: result.experiment_name ?? "",
-          feature_name: result.feature_name,
-          status: result.status,
-          value: result.value,
-          duration_ms: result.duration_ms,
-          model: result.model,
-          error: result.error,
-          judge_status: result.judge_result?.status ?? "",
-          judge_verdict: result.judge_result?.verdict ?? "",
-          judge_score: result.judge_result?.score ?? "",
-          judge_rationale: result.judge_result?.rationale ?? "",
-          judge_model: result.judge_result?.model ?? "",
-          judge_error: result.judge_result?.error ?? "",
-          report_text: "",
-        });
-      }
+
+      row.row_status = rowStatus;
+      row.row_error_count = rowErrors.length;
+      row.row_errors = rowErrors.join(" | ");
+      rows.push(row);
     }
 
     if (rows.length === 0) {
@@ -1800,21 +2017,14 @@ function App() {
       "run_index",
       "report_index",
       "row_number",
+      "study_id",
       "experiment_id",
       "experiment_name",
-      "feature_name",
-      "status",
-      "value",
-      "duration_ms",
-      "model",
-      "error",
-      "judge_status",
-      "judge_verdict",
-      "judge_score",
-      "judge_rationale",
-      "judge_model",
-      "judge_error",
+      "row_status",
+      "row_error_count",
+      "row_errors",
       "report_text",
+      ...featureColumns,
     ];
     const suffix = currentJob.job_id || `run_${Date.now()}`;
     triggerCsvDownload(`calibrator_run_${suffix}.csv`, headers, rows);
@@ -1947,6 +2157,17 @@ function App() {
   const latestJobStatus = jobQuery.data?.status ?? "idle";
   const hasRunResultsForExport = reportResults.length > 0 || flatResults.length > 0;
   const hasRunHistoryForExport = runHistory.length > 0;
+  const extractionJobStatus = extractionJobQuery.data?.status ?? "idle";
+  const extractionIsRunning =
+    extractionJobStatus === "pending" || extractionJobStatus === "running";
+  const extractionCanDownload =
+    Boolean(extractionJobQuery.data?.output_csv_path) &&
+    (extractionJobStatus === "completed" || extractionJobStatus === "cancelled");
+  const extractionProgressText = extractionJobQuery.data
+    ? extractionJobQuery.data.total_rows !== null && extractionJobQuery.data.progress_percent !== null
+      ? `${extractionJobQuery.data.processed_rows}/${extractionJobQuery.data.total_rows} rows (${extractionJobQuery.data.progress_percent}%)`
+      : `${extractionJobQuery.data.processed_rows} rows processed (${extractionJobQuery.data.rows_per_minute.toFixed(1)} rows/min)`
+    : "Not started";
 
   return (
     <div className="page-shell">
@@ -2012,6 +2233,15 @@ function App() {
           aria-selected={activeTab === "test"}
         >
           Test
+        </button>
+        <button
+          className={`tab-btn ${activeTab === "production" ? "active" : ""}`}
+          onClick={() => setActiveTab("production")}
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "production"}
+        >
+          Production
         </button>
       </nav>
 
@@ -2152,10 +2382,10 @@ function App() {
                 <button
                   className="btn btn-ghost"
                   onClick={handleStopLlamaServer}
-                  disabled={stopLlamaMutation.isPending}
+                  disabled={stopLlamaMutation.isPending || isLlamaServerStopped}
                   type="button"
                 >
-                  {stopLlamaMutation.isPending ? "Stopping server..." : "Stop local server"}
+                  {stopLlamaButtonLabel}
                 </button>
               </div>
 
@@ -2327,7 +2557,7 @@ function App() {
 
               <p className="muted">
                 {llamaStatus
-                  ? `Local server ${llamaStatus.process_running ? "running" : "idle"} at ${llamaStatus.llama_url}.`
+                  ? `Local server ${llamaStatus.process_running ? "running" : "stopped"} at ${llamaStatus.llama_url}.`
                   : `Local server will run at http://127.0.0.1:${llamaPort}.`}
               </p>
               <p className="muted">
@@ -2943,6 +3173,7 @@ function App() {
                 </button>
               )}
             </div>
+
           </article>
 
           <article className="panel card">
@@ -3208,6 +3439,130 @@ function App() {
         </section>
       )}
 
+      {activeTab === "production" && (
+        <section className="view">
+          <article className="panel card">
+            <div className="section-title">
+              <h2>Production extraction</h2>
+              <p>Run the full loaded CSV and persist extracted values to an output CSV.</p>
+            </div>
+
+              <label>
+                Output name (optional)
+                <input
+                  value={extractionOutputName}
+                  onChange={(event) => setExtractionOutputName(event.target.value)}
+                  placeholder="my_extraction_batch"
+                />
+              </label>
+
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={extractionResumeEnabled}
+                  onChange={(event) => setExtractionResumeEnabled(event.target.checked)}
+                />
+                Resume by default when output already exists
+              </label>
+
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={overwriteExtractionOutput}
+                  onChange={(event) => setOverwriteExtractionOutput(event.target.checked)}
+                />
+                Overwrite output if it already exists
+              </label>
+
+              <p className="muted">
+                Source CSV path: <b>{session.csv_path || "none selected"}</b>
+              </p>
+              <p className="muted">
+                Extraction status: <b>{extractionJobStatus}</b>. Progress: <b>{extractionProgressText}</b>.
+              </p>
+              {(extractionResumeMode || extractionJobQuery.data?.resume_mode) && (
+                <p className="muted">
+                  Resume mode: <b>{extractionJobQuery.data?.resume_mode ?? extractionResumeMode}</b>. Start row:{" "}
+                  <b>{(extractionJobQuery.data?.processed_rows_at_start ?? extractionProcessedRowsAtStart) + 1}</b>
+                </p>
+              )}
+              {(extractionJobQuery.data?.output_csv_path || extractionOutputPath) && (
+                <p className="muted">
+                  Output file: <b>{extractionJobQuery.data?.output_csv_path ?? extractionOutputPath}</b>
+                </p>
+              )}
+
+              {extractionJobQuery.data && (
+                <div className="meta-grid">
+                  <div>Processed rows: {extractionJobQuery.data.processed_rows}</div>
+                  <div>OK rows: {extractionJobQuery.data.ok_rows}</div>
+                  <div>Error rows: {extractionJobQuery.data.error_rows}</div>
+                  <div>Rows/min: {extractionJobQuery.data.rows_per_minute.toFixed(1)}</div>
+                  <div>Elapsed seconds: {extractionJobQuery.data.elapsed_seconds.toFixed(1)}</div>
+                  <div>
+                    Last source row: {extractionJobQuery.data.last_source_row_number ?? "not started"}
+                  </div>
+                  <div>Cancel requested: {extractionJobQuery.data.cancel_requested ? "yes" : "no"}</div>
+                </div>
+              )}
+
+            <div className="action-row">
+              <button
+                className="btn btn-primary"
+                onClick={() => void handleRunExtractionJob()}
+                  disabled={
+                    runExtractionMutation.isPending ||
+                    extractionIsRunning ||
+                    ensureLlamaMutation.isPending ||
+                    !session.csv_path.trim()
+                  }
+                type="button"
+              >
+                {ensureLlamaMutation.isPending
+                  ? "Preparing model..."
+                  : runExtractionMutation.isPending || extractionIsRunning
+                    ? "Running extraction..."
+                    : "Run full extraction job"}
+              </button>
+              {(extractionIsRunning ||
+                cancelExtractionMutation.isPending ||
+                Boolean(extractionJobQuery.data?.cancel_requested)) && (
+                <button
+                  className="btn btn-ghost"
+                  onClick={() => {
+                    if (extractionJobId) {
+                      cancelExtractionMutation.mutate(extractionJobId);
+                    }
+                  }}
+                  disabled={
+                    !extractionIsRunning ||
+                    cancelExtractionMutation.isPending ||
+                    Boolean(extractionJobQuery.data?.cancel_requested)
+                  }
+                  type="button"
+                >
+                  {cancelExtractionMutation.isPending
+                    ? "Cancelling..."
+                    : extractionJobQuery.data?.cancel_requested
+                      ? "Cancel requested"
+                      : "Cancel extraction"}
+                </button>
+              )}
+              <button
+                className="btn btn-secondary"
+                onClick={handleDownloadExtractionCsv}
+                disabled={!extractionCanDownload}
+                type="button"
+              >
+                Download extracted CSV
+              </button>
+            </div>
+
+            {extractionJobStatus === "failed" && <p className="error">{extractionJobQuery.data?.error}</p>}
+          </article>
+        </section>
+      )}
+
       <section className="diagnostics panel card">
         <h2>Last Action</h2>
         <p>
@@ -3215,7 +3570,9 @@ function App() {
           {isLocalSchemaIOPending ? "pending" : "idle"}. Llama setup: {listLocalModelsMutation.status}/
           {ensureLlamaMutation.status}. HF install:{" "}
           {searchHfModelsMutation.status}/{listHfFilesMutation.status}/{downloadHfModelMutation.status}. Tests:{" "}
-          {testFeatureMutation.status}/{testBatchMutation.status}. Job fetch: {jobQuery.status}.
+          {testFeatureMutation.status}/{testBatchMutation.status}. Extraction:{" "}
+          {runExtractionMutation.status}/{cancelExtractionMutation.status}/{extractionJobQuery.status}. Job fetch:{" "}
+          {jobQuery.status}.
         </p>
       </section>
 

@@ -83,10 +83,15 @@ class CalibrationJobStore:
                 if parsed > 0:
                     row_number = parsed
 
+            study_id = str(item.get("study_id", "")).strip()
+            if not study_id and row_number is not None:
+                study_id = f"row_{row_number}"
+
             clean_reports.append(
                 {
                     "report_text": report_text,
                     "row_number": row_number,
+                    "study_id": study_id,
                 }
             )
 
@@ -142,6 +147,7 @@ class CalibrationJobStore:
                 result_payload = dict(result)
                 result_payload["report_index"] = 1
                 result_payload["row_number"] = None
+                result_payload["study_id"] = "row_1"
 
             with self._lock:
                 current = self._jobs[job_id]
@@ -172,6 +178,7 @@ class CalibrationJobStore:
                         "run_index": 1,
                         "report_index": 1,
                         "row_number": None,
+                        "study_id": "row_1",
                         "report_text": report_text,
                         "experiment_id": str(options.experiment_id or "").strip(),
                         "experiment_name": str(options.experiment_name or "").strip(),
@@ -222,6 +229,7 @@ class CalibrationJobStore:
 
                 report_text = str(report_item.get("report_text", "") or "")
                 row_number = report_item.get("row_number")
+                study_id = str(report_item.get("study_id", "") or "").strip()
                 for options in options_list:
                     if should_cancel():
                         break
@@ -246,6 +254,7 @@ class CalibrationJobStore:
                         result_payload["run_index"] = run_index
                         result_payload["report_index"] = report_index
                         result_payload["row_number"] = row_number
+                        result_payload["study_id"] = study_id
                         result_payload["experiment_id"] = (
                             str(result_payload.get("experiment_id", "")).strip()
                             or str(options.experiment_id or "").strip()
@@ -279,6 +288,7 @@ class CalibrationJobStore:
                                 "run_index": run_index,
                                 "report_index": report_index,
                                 "row_number": row_number,
+                                "study_id": study_id,
                                 "report_text": report_text,
                                 "experiment_id": str(options.experiment_id or "").strip(),
                                 "experiment_name": str(options.experiment_name or "").strip(),

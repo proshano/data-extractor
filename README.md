@@ -74,3 +74,21 @@ VITE_API_BASE=http://127.0.0.1:8000 npm run dev -- --host 127.0.0.1 --port 5173
 - Frontend app: `frontend/calibrator-ui/src/App.tsx`
 - One-command launcher: `scripts/run_calibrator_web.sh`
 - Dependency installer: `scripts/install_calibrator_web_deps.sh`
+
+## Extraction API (Large CSV)
+
+Use the v2 off-disk extraction path for production and large CSV files:
+
+- `POST /api/extract/v2/run`
+- `GET /api/extract/v2/jobs/{job_id}`
+- `POST /api/extract/v2/jobs/{job_id}/cancel`
+- `GET /api/extract/v2/jobs/{job_id}/download`
+
+Key v2 behavior:
+
+- Input is disk-path only (`input_csv_path`), no upload payload.
+- Output is always scoped to managed export root (`~/.data_prompt_calibrator/exports`, or `CALIBRATOR_EXPORT_ROOT`).
+- Resume is enabled by default with checkpoint sidecar files.
+- Progress starts immediately without pre-counting full CSV rows.
+
+Legacy endpoint `POST /api/extract/run` is still available for compatibility, but new production runs should use v2.

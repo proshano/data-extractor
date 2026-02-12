@@ -151,6 +151,10 @@ Core API endpoints:
 - `POST /api/test/feature`
 - `POST /api/test/all`
 - `POST /api/test/batch`
+- `POST /api/extract/run`
+- `GET /api/extract/jobs/{job_id}`
+- `POST /api/extract/jobs/{job_id}/cancel`
+- `GET /api/extract/jobs/{job_id}/download`
 - `GET /api/jobs/{job_id}`
 - `POST /api/jobs/{job_id}/cancel`
 - `GET /api/health`

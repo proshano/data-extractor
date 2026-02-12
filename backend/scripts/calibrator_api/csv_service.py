@@ -4,8 +4,9 @@ import base64
 import binascii
 import csv
 import io
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 
 ENCODINGS_TO_TRY = ["utf-8-sig", "utf-8", "latin-1"]
@@ -30,6 +31,20 @@ def _decode_bytes(raw_bytes: bytes) -> Tuple[str, str]:
         except UnicodeDecodeError as exc:
             last_error = str(exc)
     raise CsvServiceError(f"Failed to decode CSV bytes with supported encodings. Last error: {last_error}")
+
+
+def _detect_encoding_from_file(csv_path: Path) -> str:
+    if not csv_path.exists():
+        raise CsvServiceError(f"CSV file not found: {csv_path}")
+
+    with csv_path.open("rb") as handle:
+        sample_bytes = handle.read(65536)
+
+    if not sample_bytes:
+        raise CsvServiceError("CSV payload is empty.")
+
+    _, encoding = _decode_bytes(sample_bytes)
+    return encoding
 
 
 def _detect_dialect(sample: str) -> csv.Dialect:
@@ -71,6 +86,13 @@ def _read_csv_text(csv_text: str) -> Tuple[List[str], List[Dict[str, str]], str]
     return headers, rows, str(getattr(dialect, "delimiter", ","))
 
 
+def _decode_base64_payload(file_base64: str) -> bytes:
+    try:
+        return base64.b64decode(file_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise CsvServiceError(f"Invalid base64 CSV payload: {exc}") from exc
+
+
 def _pick_existing_column(headers: Sequence[str], candidates: Sequence[str]) -> str:
     lowered_to_actual = {column.lower(): column for column in headers}
     for candidate in candidates:
@@ -101,20 +123,17 @@ def _build_preview_rows(rows: Sequence[Dict[str, str]], preview_rows: int) -> Li
     return preview
 
 
-def parse_csv_bytes(
-    raw_bytes: bytes,
+def _build_parse_response(
     *,
-    preview_rows: int = 5,
-    requested_id_column: str = "",
-    requested_report_column: str = "",
-    source_name: str = "uploaded.csv",
+    source_name: str,
+    headers: List[str],
+    rows: List[Dict[str, str]],
+    encoding: str,
+    delimiter: str,
+    preview_rows: int,
+    requested_id_column: str,
+    requested_report_column: str,
 ) -> Dict[str, Any]:
-    if not raw_bytes:
-        raise CsvServiceError("CSV payload is empty.")
-
-    csv_text, encoding = _decode_bytes(raw_bytes)
-    headers, rows, delimiter = _read_csv_text(csv_text)
-
     resolved_id = _resolve_requested_column(headers, requested_id_column)
     if resolved_id and resolved_id not in headers:
         resolved_id = ""
@@ -138,6 +157,27 @@ def parse_csv_bytes(
     }
 
 
+def parse_csv_bytes(
+    raw_bytes: bytes,
+    *,
+    preview_rows: int = 5,
+    requested_id_column: str = "",
+    requested_report_column: str = "",
+    source_name: str = "uploaded.csv",
+) -> Dict[str, Any]:
+    rows_payload = read_csv_rows_from_bytes(raw_bytes, source_name=source_name)
+    return _build_parse_response(
+        source_name=rows_payload["source"],
+        headers=rows_payload["columns"],
+        rows=rows_payload["rows"],
+        encoding=rows_payload["encoding"],
+        delimiter=rows_payload["delimiter"],
+        preview_rows=preview_rows,
+        requested_id_column=requested_id_column,
+        requested_report_column=requested_report_column,
+    )
+
+
 def parse_csv_file(
     csv_path: Path,
     *,
@@ -145,16 +185,16 @@ def parse_csv_file(
     requested_id_column: str = "",
     requested_report_column: str = "",
 ) -> Dict[str, Any]:
-    if not csv_path.exists():
-        raise CsvServiceError(f"CSV file not found: {csv_path}")
-
-    raw_bytes = csv_path.read_bytes()
-    return parse_csv_bytes(
-        raw_bytes,
+    rows_payload = read_csv_rows_from_file(csv_path)
+    return _build_parse_response(
+        source_name=rows_payload["source"],
+        headers=rows_payload["columns"],
+        rows=rows_payload["rows"],
+        encoding=rows_payload["encoding"],
+        delimiter=rows_payload["delimiter"],
         preview_rows=preview_rows,
         requested_id_column=requested_id_column,
         requested_report_column=requested_report_column,
-        source_name=str(csv_path),
     )
 
 
@@ -166,15 +206,91 @@ def parse_csv_base64(
     requested_id_column: str = "",
     requested_report_column: str = "",
 ) -> Dict[str, Any]:
-    try:
-        raw_bytes = base64.b64decode(file_base64, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise CsvServiceError(f"Invalid base64 CSV payload: {exc}") from exc
-
-    return parse_csv_bytes(
-        raw_bytes,
+    rows_payload = read_csv_rows_from_base64(file_base64, file_name=file_name)
+    return _build_parse_response(
+        source_name=rows_payload["source"],
+        headers=rows_payload["columns"],
+        rows=rows_payload["rows"],
+        encoding=rows_payload["encoding"],
+        delimiter=rows_payload["delimiter"],
         preview_rows=preview_rows,
         requested_id_column=requested_id_column,
         requested_report_column=requested_report_column,
-        source_name=file_name,
     )
+
+
+def read_csv_rows_from_bytes(raw_bytes: bytes, *, source_name: str = "uploaded.csv") -> Dict[str, Any]:
+    if not raw_bytes:
+        raise CsvServiceError("CSV payload is empty.")
+
+    csv_text, encoding = _decode_bytes(raw_bytes)
+    headers, rows, delimiter = _read_csv_text(csv_text)
+    return {
+        "source": source_name,
+        "columns": headers,
+        "rows": rows,
+        "row_count": len(rows),
+        "encoding": encoding,
+        "delimiter": delimiter,
+        "raw_bytes": raw_bytes,
+    }
+
+
+def read_csv_rows_from_file(csv_path: Path) -> Dict[str, Any]:
+    if not csv_path.exists():
+        raise CsvServiceError(f"CSV file not found: {csv_path}")
+
+    raw_bytes = csv_path.read_bytes()
+    return read_csv_rows_from_bytes(raw_bytes, source_name=str(csv_path))
+
+
+def read_csv_rows_from_base64(file_base64: str, *, file_name: str = "uploaded.csv") -> Dict[str, Any]:
+    raw_bytes = _decode_base64_payload(file_base64)
+    return read_csv_rows_from_bytes(raw_bytes, source_name=file_name)
+
+
+@contextmanager
+def open_csv_stream(csv_path: Path) -> Iterator[Tuple[List[str], Iterator[Dict[str, str]], str, str]]:
+    encoding = _detect_encoding_from_file(csv_path)
+    handle = csv_path.open("r", encoding=encoding, newline="")
+    try:
+        sample = handle.read(16384)
+        handle.seek(0)
+
+        dialect = _detect_dialect(sample)
+        reader = csv.DictReader(handle, dialect=dialect)
+        raw_headers = list(reader.fieldnames or [])
+        headers = [normalize_column_name(header) for header in raw_headers if header is not None]
+        if not headers:
+            raise CsvServiceError("No header columns detected.")
+        if len(set(headers)) != len(headers):
+            raise CsvServiceError(
+                f"Duplicate header names after normalization are not supported. Headers: {headers}"
+            )
+
+        delimiter = str(getattr(dialect, "delimiter", ","))
+
+        def row_iterator() -> Iterator[Dict[str, str]]:
+            for raw_row in reader:
+                row: Dict[str, str] = {}
+                for raw_key, raw_value in raw_row.items():
+                    key = normalize_column_name(raw_key or "")
+                    if not key:
+                        continue
+                    row[key] = str(raw_value or "")
+                if row:
+                    yield row
+
+        yield headers, row_iterator(), encoding, delimiter
+    finally:
+        handle.close()
+
+
+def read_csv_headers(csv_path: Path) -> Dict[str, Any]:
+    with open_csv_stream(csv_path) as (headers, _row_iterator, encoding, delimiter):
+        return {
+            "source": str(csv_path),
+            "columns": headers,
+            "encoding": encoding,
+            "delimiter": delimiter,
+        }
